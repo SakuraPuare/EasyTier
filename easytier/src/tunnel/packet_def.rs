@@ -140,6 +140,22 @@ impl PeerManagerHeader {
         self.flags = flags.bits();
     }
 
+    pub fn flow_hash_salt(&self) -> u64 {
+        let mut salt = 0xcbf2_9ce4_8422_2325u64;
+        for byte in self
+            .from_peer_id
+            .get()
+            .to_le_bytes()
+            .into_iter()
+            .chain(self.to_peer_id.get().to_le_bytes())
+            .chain([self.packet_type, self.flags])
+        {
+            salt ^= u64::from(byte);
+            salt = salt.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        salt
+    }
+
     pub fn is_latency_first(&self) -> bool {
         PeerManagerHeaderFlags::from_bits(self.flags)
             .unwrap()

@@ -72,6 +72,7 @@ pub fn gen_default_flags() -> Flags {
         instance_recv_bps_limit: u64::MAX,
         disable_upnp: false,
         disable_relay_data: false,
+        relay_load_balance: false,
     }
 }
 

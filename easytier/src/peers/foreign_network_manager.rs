@@ -571,7 +571,12 @@ impl ForeignNetworkEntry {
                         Some(peer_id) if peer_map.has_peer(peer_id) => {
                             if peer_id != to_peer_id && hdr.from_peer_id.get() == my_node_id {
                                 if let Err(e) = relay_peer_map
-                                    .send_msg(zc_packet, to_peer_id, NextHopPolicy::LeastHop)
+                                    .send_msg(
+                                        zc_packet,
+                                        to_peer_id,
+                                        NextHopPolicy::LeastHop,
+                                        to_peer_id as u64,
+                                    )
                                     .await
                                 {
                                     tracing::error!(

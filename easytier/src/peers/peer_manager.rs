@@ -2,6 +2,10 @@ use anyhow::Context;
 use async_trait::async_trait;
 use cidr::{Ipv4Cidr, Ipv6Cidr};
 use dashmap::DashMap;
+use pnet::packet::{
+    Packet as _, ip::IpNextHeaderProtocols, ipv4::Ipv4Packet, ipv6::Ipv6Packet, tcp::TcpPacket,
+    udp::UdpPacket,
+};
 use std::collections::BTreeSet;
 use std::{
     fmt::Debug,
@@ -200,6 +204,76 @@ impl PeerManager {
     // Keep lazy-p2p demand alive across the 5s task rescan interval and a full on-demand
     // connect attempt, without retaining extra per-task state in the hot path.
     const RECENT_HAVE_TRAFFIC_TTL: Duration = Duration::from_secs(30);
+
+    fn update_flow_hash(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn update_flow_hash_u16(hash: &mut u64, value: u16) {
+        Self::update_flow_hash(hash, &value.to_be_bytes());
+    }
+
+    fn relay_flow_hash_key(msg: &ZCPacket) -> u64 {
+        let mut hash = msg
+            .peer_manager_header()
+            .map(|hdr| hdr.flow_hash_salt())
+            .unwrap_or(0xcbf2_9ce4_8422_2325);
+        let payload = msg.payload();
+
+        if let Some(ipv4) = Ipv4Packet::new(payload)
+            && ipv4.get_version() == 4
+        {
+            Self::update_flow_hash(&mut hash, &ipv4.get_source().octets());
+            Self::update_flow_hash(&mut hash, &ipv4.get_destination().octets());
+            Self::update_flow_hash(&mut hash, &[ipv4.get_next_level_protocol().0]);
+            match ipv4.get_next_level_protocol() {
+                IpNextHeaderProtocols::Tcp => {
+                    if let Some(tcp) = TcpPacket::new(ipv4.payload()) {
+                        Self::update_flow_hash_u16(&mut hash, tcp.get_source());
+                        Self::update_flow_hash_u16(&mut hash, tcp.get_destination());
+                    }
+                }
+                IpNextHeaderProtocols::Udp => {
+                    if let Some(udp) = UdpPacket::new(ipv4.payload()) {
+                        Self::update_flow_hash_u16(&mut hash, udp.get_source());
+                        Self::update_flow_hash_u16(&mut hash, udp.get_destination());
+                    }
+                }
+                _ => {}
+            }
+            return hash;
+        }
+
+        if let Some(ipv6) = Ipv6Packet::new(payload)
+            && ipv6.get_version() == 6
+        {
+            Self::update_flow_hash(&mut hash, &ipv6.get_source().octets());
+            Self::update_flow_hash(&mut hash, &ipv6.get_destination().octets());
+            Self::update_flow_hash(&mut hash, &[ipv6.get_next_header().0]);
+            match ipv6.get_next_header() {
+                IpNextHeaderProtocols::Tcp => {
+                    if let Some(tcp) = TcpPacket::new(ipv6.payload()) {
+                        Self::update_flow_hash_u16(&mut hash, tcp.get_source());
+                        Self::update_flow_hash_u16(&mut hash, tcp.get_destination());
+                    }
+                }
+                IpNextHeaderProtocols::Udp => {
+                    if let Some(udp) = UdpPacket::new(ipv6.payload()) {
+                        Self::update_flow_hash_u16(&mut hash, udp.get_source());
+                        Self::update_flow_hash_u16(&mut hash, udp.get_destination());
+                    }
+                }
+                _ => {}
+            }
+            return hash;
+        }
+
+        Self::update_flow_hash(&mut hash, payload);
+        hash
+    }
 
     fn should_mark_recent_traffic_for_fanout(total_dst_peers: usize) -> bool {
         total_dst_peers <= 1
@@ -1080,6 +1154,7 @@ impl PeerManager {
                         tx_metrics,
                         ret,
                         to_peer_id,
+                        None,
                     )
                     .await;
                     if ret.is_err() {
@@ -1460,6 +1535,8 @@ impl PeerManager {
             .compress_tx_bytes_before
             .add(msg.buf_len() as u64);
 
+        let flow_hash_key = Self::relay_flow_hash_key(&msg);
+
         Self::try_compress_and_encrypt(
             self.data_compress_algo,
             &self.encryptor,
@@ -1480,6 +1557,7 @@ impl PeerManager {
             Some(&self.traffic_metrics),
             msg,
             dst_peer_id,
+            Some(flow_hash_key),
         )
         .await;
         if result.is_ok() {
@@ -1496,6 +1574,7 @@ impl PeerManager {
         direct_tx_metrics: Option<&Arc<TrafficMetricRecorder>>,
         msg: ZCPacket,
         dst_peer_id: PeerId,
+        flow_hash_key: Option<u64>,
     ) -> Result<(), Error> {
         let policy =
             Self::get_next_hop_policy(msg.peer_manager_header().unwrap().is_latency_first());
@@ -1507,7 +1586,14 @@ impl PeerManager {
             foreign_network_client.send_msg(msg, dst_peer_id).await
         } else if let Some(gateway) = peers.get_gateway_peer_id(dst_peer_id, policy.clone()).await {
             if peers.has_peer(gateway) || foreign_network_client.has_next_hop(gateway) {
-                relay_peer_map.send_msg(msg, dst_peer_id, policy).await
+                relay_peer_map
+                    .send_msg(
+                        msg,
+                        dst_peer_id,
+                        policy,
+                        flow_hash_key.unwrap_or(dst_peer_id as u64),
+                    )
+                    .await
             } else {
                 tracing::warn!(
                     ?gateway,
@@ -1673,6 +1759,7 @@ impl PeerManager {
         let cur_to_peer_id = msg.peer_manager_header().unwrap().to_peer_id.into();
         if cur_to_peer_id != 0 {
             self.mark_recent_traffic(cur_to_peer_id);
+            let flow_hash_key = Self::relay_flow_hash_key(&msg);
             return Self::send_msg_internal(
                 &self.peers,
                 &self.foreign_network_client,
@@ -1680,6 +1767,7 @@ impl PeerManager {
                 Some(&self.traffic_metrics),
                 msg,
                 cur_to_peer_id,
+                Some(flow_hash_key),
             )
             .await;
         }
@@ -1697,6 +1785,8 @@ impl PeerManager {
         self.self_tx_counters
             .compress_tx_bytes_before
             .add(msg.buf_len() as u64);
+
+        let flow_hash_key = Self::relay_flow_hash_key(&msg);
 
         Self::try_compress_and_encrypt(
             self.data_compress_algo,
@@ -1764,6 +1854,7 @@ impl PeerManager {
                 Some(&self.traffic_metrics),
                 msg,
                 *peer_id,
+                Some(flow_hash_key),
             )
             .await
             {
@@ -2388,6 +2479,7 @@ mod tests {
             Some(&peer_mgr.traffic_metrics),
             pkt,
             dst_peer_id,
+            None,
         )
         .await;
 
@@ -2457,6 +2549,7 @@ mod tests {
             Some(&peer_mgr.traffic_metrics),
             pkt,
             dst_peer_id,
+            None,
         )
         .await
         .unwrap();
@@ -2544,6 +2637,7 @@ mod tests {
             Some(&peer_mgr_a.traffic_metrics),
             pkt,
             peer_mgr_b.my_peer_id(),
+            None,
         )
         .await
         .unwrap();
@@ -2612,6 +2706,7 @@ mod tests {
             Some(&peer_mgr_a.traffic_metrics),
             pkt,
             peer_mgr_b.my_peer_id(),
+            None,
         )
         .await
         .unwrap();
@@ -2688,6 +2783,7 @@ mod tests {
             Some(&peer_mgr_a.traffic_metrics),
             pkt,
             peer_mgr_c.my_peer_id(),
+            None,
         )
         .await
         .unwrap();
@@ -2753,6 +2849,7 @@ mod tests {
             Some(&peer_mgr_a.traffic_metrics),
             pkt,
             peer_mgr_c.my_peer_id(),
+            None,
         )
         .await
         .unwrap();

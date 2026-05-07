@@ -780,6 +780,10 @@ impl NetworkConfig {
             flags.relay_all_peer_rpc = relay_all_peer_rpc;
         }
 
+        if let Some(relay_load_balance) = self.relay_load_balance {
+            flags.relay_load_balance = relay_load_balance;
+        }
+
         if let Some(need_p2p) = self.need_p2p {
             flags.need_p2p = need_p2p;
         }
@@ -987,6 +991,7 @@ impl NetworkConfig {
         result.no_tun = Some(flags.no_tun);
         result.enable_exit_node = Some(flags.enable_exit_node);
         result.relay_all_peer_rpc = Some(flags.relay_all_peer_rpc);
+        result.relay_load_balance = Some(flags.relay_load_balance);
         result.need_p2p = Some(flags.need_p2p);
         result.multi_thread = Some(flags.multi_thread);
         result.proxy_forward_by_system = Some(flags.proxy_forward_by_system);
@@ -1256,6 +1261,7 @@ mod tests {
                 flags.no_tun = rng.gen_bool(0.1);
                 flags.enable_exit_node = rng.gen_bool(0.4);
                 flags.relay_all_peer_rpc = rng.gen_bool(0.5);
+                flags.relay_load_balance = rng.gen_bool(0.5);
                 flags.need_p2p = rng.gen_bool(0.3);
                 flags.multi_thread = rng.gen_bool(0.7);
                 flags.proxy_forward_by_system = rng.gen_bool(0.3);

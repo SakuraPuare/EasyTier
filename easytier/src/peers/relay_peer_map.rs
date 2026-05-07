@@ -25,6 +25,22 @@ const HANDSHAKE_RETRY_BASE_MS: u64 = 200;
 const HANDSHAKE_MAX_ATTEMPTS: u32 = 3;
 const MAX_PENDING_PACKETS_PER_PEER: usize = 32;
 
+fn pick_next_hop_candidate(
+    candidates: &[PeerId],
+    flow_hash_key: Option<u64>,
+    relay_load_balance: bool,
+) -> PeerId {
+    if candidates.len() <= 1 || !relay_load_balance {
+        return candidates[0];
+    }
+
+    let Some(flow_hash_key) = flow_hash_key else {
+        return candidates[0];
+    };
+
+    candidates[flow_hash_key as usize % candidates.len()]
+}
+
 #[derive(Clone)]
 pub struct RelayPeerState {
     pub last_active_at: Instant,
@@ -51,7 +67,7 @@ pub struct RelayPeerMap {
     states: DashMap<PeerId, RelayPeerState>,
     pending_handshakes: DashMap<PeerId, oneshot::Sender<ZCPacket>>,
     handshake_locks: DashMap<PeerId, Arc<Mutex<()>>>,
-    pub(crate) pending_packets: DashMap<PeerId, Vec<(ZCPacket, NextHopPolicy)>>,
+    pub(crate) pending_packets: DashMap<PeerId, Vec<(ZCPacket, NextHopPolicy, u64)>>,
 
     is_secure_mode_enabled: bool,
     control_metrics: AggregateTrafficMetrics,
@@ -138,9 +154,18 @@ impl RelayPeerMap {
         let mut pkt = ZCPacket::new_with_payload(&payload);
         pkt.fill_peer_manager_hdr(self.my_peer_id, dst_peer_id, packet_type as u8);
         let pkt_len = pkt.buf_len() as u64;
-        self.send_via_next_hop(pkt, dst_peer_id, policy).await?;
+        self.send_via_next_hop(pkt, dst_peer_id, policy, None)
+            .await?;
         self.control_metrics.record_tx(pkt_len);
         Ok(())
+    }
+
+    fn pick_next_hop(&self, candidates: &[PeerId], flow_hash_key: Option<u64>) -> PeerId {
+        pick_next_hop_candidate(
+            candidates,
+            flow_hash_key,
+            self.global_ctx.get_flags().relay_load_balance,
+        )
     }
 
     async fn send_via_next_hop(
@@ -148,12 +173,30 @@ impl RelayPeerMap {
         msg: ZCPacket,
         dst_peer_id: PeerId,
         policy: NextHopPolicy,
+        flow_hash_key: Option<u64>,
     ) -> Result<(), Error> {
-        let Some(next_hop) = self.peer_map.get_gateway_peer_id(dst_peer_id, policy).await else {
+        let candidates = self
+            .peer_map
+            .get_gateway_peer_id_candidates(dst_peer_id, policy)
+            .await;
+        let candidates = candidates
+            .into_iter()
+            .filter(|peer_id| {
+                self.peer_map.has_peer(*peer_id)
+                    || self
+                        .foreign_network_client
+                        .as_ref()
+                        .map(|client| client.has_next_hop(*peer_id))
+                        .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
             return Err(Error::RouteError(Some(format!(
                 "next hop not found in route for peer {dst_peer_id:?}"
             ))));
-        };
+        }
+
+        let next_hop = self.pick_next_hop(&candidates, flow_hash_key);
         if self.peer_map.has_peer(next_hop) {
             self.peer_map.send_msg_directly(msg, next_hop).await
         } else if let Some(foreign_network_client) = &self.foreign_network_client {
@@ -170,6 +213,7 @@ impl RelayPeerMap {
         mut msg: ZCPacket,
         dst_peer_id: PeerId,
         policy: NextHopPolicy,
+        flow_hash_key: u64,
     ) -> Result<(), Error> {
         let now = Instant::now();
 
@@ -185,19 +229,26 @@ impl RelayPeerMap {
                 }
                 Err(_) => {
                     // Handshake in progress, buffer the packet instead of dropping it
-                    self.buffer_pending_packet(dst_peer_id, msg, policy);
+                    self.buffer_pending_packet(dst_peer_id, msg, policy, flow_hash_key);
                     return Ok(());
                 }
             }
         }
 
-        self.send_via_next_hop(msg, dst_peer_id, policy).await
+        self.send_via_next_hop(msg, dst_peer_id, policy, Some(flow_hash_key))
+            .await
     }
 
-    fn buffer_pending_packet(&self, dst_peer_id: PeerId, pkt: ZCPacket, policy: NextHopPolicy) {
+    fn buffer_pending_packet(
+        &self,
+        dst_peer_id: PeerId,
+        pkt: ZCPacket,
+        policy: NextHopPolicy,
+        flow_hash_key: u64,
+    ) {
         let mut entry = self.pending_packets.entry(dst_peer_id).or_default();
         if entry.len() < MAX_PENDING_PACKETS_PER_PEER {
-            entry.push((pkt, policy));
+            entry.push((pkt, policy, flow_hash_key));
         }
         // silently drop when buffer is full
     }
@@ -215,14 +266,16 @@ impl RelayPeerMap {
             "flushing pending packets after relay handshake"
         );
 
-        for (mut pkt, policy) in packets {
+        for (mut pkt, policy, flow_hash_key) in packets {
             if session
                 .encrypt_payload(self.my_peer_id, dst_peer_id, &mut pkt)
                 .is_err()
             {
                 continue;
             }
-            let _ = self.send_via_next_hop(pkt, dst_peer_id, policy).await;
+            let _ = self
+                .send_via_next_hop(pkt, dst_peer_id, policy, Some(flow_hash_key))
+                .await;
         }
     }
 
@@ -689,5 +742,34 @@ impl RelayPeerMap {
         shrink_dashmap(&self.pending_packets, None);
 
         tracing::debug!(?peer_id, "RelayPeerMap removed peer relay state");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pick_next_hop_candidate;
+
+    #[test]
+    fn pick_next_hop_candidate_uses_first_when_disabled() {
+        let candidates = [10, 20, 30];
+
+        assert_eq!(
+            pick_next_hop_candidate(&candidates, Some(1), false),
+            candidates[0]
+        );
+        assert_eq!(
+            pick_next_hop_candidate(&candidates, None, true),
+            candidates[0]
+        );
+    }
+
+    #[test]
+    fn pick_next_hop_candidate_uses_flow_hash_when_enabled() {
+        let candidates = [10, 20, 30];
+
+        assert_eq!(pick_next_hop_candidate(&candidates, Some(0), true), 10);
+        assert_eq!(pick_next_hop_candidate(&candidates, Some(1), true), 20);
+        assert_eq!(pick_next_hop_candidate(&candidates, Some(2), true), 30);
+        assert_eq!(pick_next_hop_candidate(&candidates, Some(4), true), 20);
     }
 }

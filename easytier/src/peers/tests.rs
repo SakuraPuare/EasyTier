@@ -468,7 +468,7 @@ async fn relay_peer_map_retry_backoff_and_evict() {
     let mut pkt = ZCPacket::new_with_payload(b"evict");
     pkt.fill_peer_manager_hdr(30, 40, PacketType::Data as u8);
     let _ = relay_map_plain
-        .send_msg(pkt, 40, NextHopPolicy::LeastHop)
+        .send_msg(pkt, 40, NextHopPolicy::LeastHop, 40)
         .await;
     assert!(relay_map_plain.has_state(40));
     relay_map_plain.evict_idle_sessions(Duration::from_millis(0));
@@ -493,7 +493,9 @@ async fn relay_peer_map_pending_packet_buffer() {
     for i in 0..5u8 {
         let mut pkt = ZCPacket::new_with_payload(&[i]);
         pkt.fill_peer_manager_hdr(10, 20, PacketType::Data as u8);
-        let _ = relay_map.send_msg(pkt, 20, NextHopPolicy::LeastHop).await;
+        let _ = relay_map
+            .send_msg(pkt, 20, NextHopPolicy::LeastHop, 20)
+            .await;
     }
 
     // Verify packets were buffered
@@ -511,7 +513,9 @@ async fn relay_peer_map_pending_packet_buffer() {
     for i in 0..50u8 {
         let mut pkt = ZCPacket::new_with_payload(&[i]);
         pkt.fill_peer_manager_hdr(10, 20, PacketType::Data as u8);
-        let _ = relay_map.send_msg(pkt, 20, NextHopPolicy::LeastHop).await;
+        let _ = relay_map
+            .send_msg(pkt, 20, NextHopPolicy::LeastHop, 20)
+            .await;
     }
 
     let buffered = relay_map
@@ -585,11 +589,11 @@ async fn relay_peer_map_pending_packets_flushed_on_handshake_success() {
     for i in 0..3u8 {
         let mut pkt = ZCPacket::new_with_payload(&[i]);
         pkt.fill_peer_manager_hdr(peer_a_id, peer_c_id, PacketType::Data as u8);
-        relay_a
-            .pending_packets
-            .entry(peer_c_id)
-            .or_default()
-            .push((pkt, NextHopPolicy::LeastHop));
+        relay_a.pending_packets.entry(peer_c_id).or_default().push((
+            pkt,
+            NextHopPolicy::LeastHop,
+            peer_c_id as u64,
+        ));
     }
 
     assert_eq!(

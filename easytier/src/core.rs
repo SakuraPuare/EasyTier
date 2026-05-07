@@ -495,6 +495,15 @@ struct NetworkOptions {
 
     #[arg(
         long,
+        env = "ET_RELAY_LOAD_BALANCE",
+        help = t!("core_clap.relay_load_balance").to_string(),
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    relay_load_balance: Option<bool>,
+
+    #[arg(
+        long,
         env = "ET_NEED_P2P",
         help = t!("core_clap.need_p2p").to_string(),
         num_args = 0..=1,
@@ -1103,6 +1112,7 @@ impl NetworkOptions {
             .disable_udp_hole_punching
             .unwrap_or(f.disable_udp_hole_punching);
         f.relay_all_peer_rpc = self.relay_all_peer_rpc.unwrap_or(f.relay_all_peer_rpc);
+        f.relay_load_balance = self.relay_load_balance.unwrap_or(f.relay_load_balance);
         f.need_p2p = self.need_p2p.unwrap_or(f.need_p2p);
         f.multi_thread = self.multi_thread.unwrap_or(f.multi_thread);
         if let Some(compression) = &self.compression {
