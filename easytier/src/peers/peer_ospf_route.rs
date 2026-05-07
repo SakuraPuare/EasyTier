@@ -62,7 +62,7 @@ use crate::{
 
 use super::{
     PeerPacketFilter,
-    graph_algo::dijkstra_with_first_hop,
+    graph_algo::dijkstra_with_multi_first_hops,
     peer_rpc::PeerRpcManager,
     public_ipv6::{
         PublicIpv6PeerRouteInfo, PublicIpv6RouteControl, PublicIpv6Service, PublicIpv6SyncTrigger,
@@ -1310,7 +1310,7 @@ impl SyncedRouteInfo {
 
 type PeerGraph = Graph<PeerId, usize, Directed>;
 type PeerIdToNodexIdxMap = DashMap<PeerId, NodeIndex>;
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct NextHopInfo {
     next_hop_peer_id: PeerId,
     path_latency: i32,
@@ -1319,12 +1319,14 @@ struct NextHopInfo {
 }
 // dst_peer_id -> (next_hop_peer_id, cost, path_len)
 type NextHopMap = DashMap<PeerId, NextHopInfo>;
+type NextHopCandidatesMap = DashMap<PeerId, Vec<NextHopInfo>>;
 
 // computed with SyncedRouteInfo. used to get next hop.
 #[derive(Debug)]
 struct RouteTable {
     peer_infos: DashMap<PeerId, RoutePeerInfo>,
     next_hop_map: NextHopMap,
+    next_hop_candidates_map: NextHopCandidatesMap,
     ipv4_peer_id_map: DashMap<Ipv4Addr, PeerIdVersion>,
     ipv6_peer_id_map: DashMap<Ipv6Addr, PeerIdVersion>,
     cidr_peer_id_map: ArcSwap<PrefixMap<Ipv4Cidr, PeerIdVersion>>,
@@ -1337,6 +1339,7 @@ impl RouteTable {
         RouteTable {
             peer_infos: DashMap::new(),
             next_hop_map: DashMap::new(),
+            next_hop_candidates_map: DashMap::new(),
             ipv4_peer_id_map: DashMap::new(),
             ipv6_peer_id_map: DashMap::new(),
             cidr_peer_id_map: ArcSwap::new(Arc::new(PrefixMap::new())),
@@ -1354,6 +1357,21 @@ impl RouteTable {
                 None
             }
         })
+    }
+
+    fn get_next_hop_candidates(&self, dst_peer_id: PeerId) -> Vec<NextHopInfo> {
+        let cur_version = self.next_hop_map_version.get();
+        self.next_hop_candidates_map
+            .get(&dst_peer_id)
+            .map(|x| {
+                x.iter()
+                    .filter(|info| info.version >= cur_version)
+                    .copied()
+                    .collect()
+            })
+            .filter(|x: &Vec<_>| !x.is_empty())
+            .or_else(|| self.get_next_hop(dst_peer_id).map(|x| vec![x]))
+            .unwrap_or_default()
     }
 
     fn peer_reachable(&self, peer_id: PeerId) -> bool {
@@ -1428,6 +1446,10 @@ impl RouteTable {
             // remove next hop map for peers we cannot reach.
             v.version >= cur_version
         });
+        self.next_hop_candidates_map.retain(|_, v| {
+            v.retain(|info| info.version >= cur_version);
+            !v.is_empty()
+        });
         self.peer_infos.retain(|k, _| {
             // remove peer info for peers we cannot reach.
             self.next_hop_map.contains_key(k)
@@ -1443,6 +1465,7 @@ impl RouteTable {
 
         shrink_dashmap(&self.peer_infos, None);
         shrink_dashmap(&self.next_hop_map, None);
+        shrink_dashmap(&self.next_hop_candidates_map, None);
         shrink_dashmap(&self.ipv4_peer_id_map, None);
         shrink_dashmap(&self.ipv6_peer_id_map, None);
     }
@@ -1512,16 +1535,27 @@ impl RouteTable {
             );
             return;
         }
-        let (costs, next_hops) = dijkstra_with_first_hop(&graph, *start_node, |e| *e.weight());
+        let (costs, next_hops) =
+            dijkstra_with_multi_first_hops(&graph, *start_node, |e| *e.weight());
 
-        for (dst, (next_hop, path_len)) in next_hops.iter() {
-            let info = NextHopInfo {
-                next_hop_peer_id: *graph.node_weight(*next_hop).unwrap(),
-                path_latency: (*costs.get(dst).unwrap() % AVOID_RELAY_COST) as i32,
-                path_len: { *path_len },
-                version,
-            };
+        for (dst, next_hops) in next_hops.iter() {
             let dst_peer_id = *graph.node_weight(*dst).unwrap();
+            let mut infos = next_hops
+                .iter()
+                .map(|(next_hop, path_len)| NextHopInfo {
+                    next_hop_peer_id: *graph.node_weight(*next_hop).unwrap(),
+                    path_latency: (*costs.get(dst).unwrap() % AVOID_RELAY_COST) as i32,
+                    path_len: *path_len,
+                    version,
+                })
+                .collect::<Vec<_>>();
+            infos.sort_by_key(|x| (x.path_len, x.path_latency, x.next_hop_peer_id));
+            infos.dedup();
+
+            let Some(info) = infos.first().copied() else {
+                continue;
+            };
+
             self.next_hop_map
                 .entry(dst_peer_id)
                 .and_modify(|x| {
@@ -1530,6 +1564,14 @@ impl RouteTable {
                     }
                 })
                 .or_insert(info);
+            self.next_hop_candidates_map
+                .entry(dst_peer_id)
+                .and_modify(|x| {
+                    if x.first().map(|x| x.version).unwrap_or(0) < version {
+                        *x = infos.clone();
+                    }
+                })
+                .or_insert(infos);
         }
 
         self.next_hop_map_version.set_if_larger(version);
@@ -3920,6 +3962,23 @@ impl Route for PeerRoute {
             .map(|x| x.next_hop_peer_id)
     }
 
+    async fn get_next_hop_candidates_with_policy(
+        &self,
+        dst_peer_id: PeerId,
+        policy: NextHopPolicy,
+    ) -> Vec<PeerId> {
+        let route_table = if matches!(policy, NextHopPolicy::LeastCost) {
+            &self.service_impl.route_table_with_cost
+        } else {
+            &self.service_impl.route_table
+        };
+        route_table
+            .get_next_hop_candidates(dst_peer_id)
+            .into_iter()
+            .map(|x| x.next_hop_peer_id)
+            .collect()
+    }
+
     async fn list_routes(&self) -> Vec<crate::proto::api::instance::Route> {
         let route_table = &self.service_impl.route_table;
         let route_table_with_cost = &self.service_impl.route_table_with_cost;
@@ -4156,7 +4215,8 @@ impl PeerPacketFilter for Arc<PeerRoute> {}
 mod tests {
     use cidr::{Ipv4Cidr, Ipv4Inet, Ipv6Inet};
     use dashmap::DashMap;
-    use parking_lot::Mutex;
+    use ordered_hash_map::OrderedHashMap;
+    use parking_lot::{Mutex, RwLock};
     use prefix_trie::PrefixMap;
     use prost_reflect::{DynamicMessage, ReflectMessage};
     use std::net::IpAddr;
@@ -4169,7 +4229,7 @@ mod tests {
         time::{Duration, SystemTime},
     };
 
-    use super::{NextHopInfo, PeerRoute, REMOVE_DEAD_PEER_INFO_AFTER, RouteConnInfo};
+    use super::{NextHopInfo, PeerRoute, REMOVE_DEAD_PEER_INFO_AFTER, RouteConnInfo, RouteTable};
     use crate::{
         common::{
             PeerId,
@@ -6671,6 +6731,73 @@ mod tests {
                 .route_table
                 .get_peer_id_for_proxy(&"10.11.0.1".parse::<IpAddr>().unwrap()),
             Some(from_peer_id)
+        );
+    }
+
+    #[test]
+    fn route_table_keeps_equal_cost_next_hop_candidates() {
+        let my_peer_id = 1;
+        let relay_a = 2;
+        let relay_b = 3;
+        let dst_peer_id = 4;
+
+        let synced = super::SyncedRouteInfo {
+            peer_infos: RwLock::new(OrderedHashMap::new()),
+            raw_peer_infos: DashMap::new(),
+            conn_map: RwLock::new(OrderedHashMap::new()),
+            foreign_network: DashMap::new(),
+            group_trust_map: DashMap::new(),
+            group_trust_map_cache: DashMap::new(),
+            trusted_credential_pubkeys: DashMap::new(),
+            non_reusable_credential_owners: DashMap::new(),
+            version: 1.into(),
+        };
+
+        {
+            let mut peer_infos = synced.peer_infos.write();
+            for peer_id in [my_peer_id, relay_a, relay_b, dst_peer_id] {
+                let mut peer_info = RoutePeerInfo::new();
+                peer_info.peer_id = peer_id;
+                peer_info.version = 1;
+                peer_infos.insert(peer_id, peer_info);
+            }
+        }
+        {
+            let mut conn_map = synced.conn_map.write();
+            conn_map.insert(
+                my_peer_id,
+                make_route_conn_info([relay_a, relay_b], SystemTime::now()),
+            );
+            conn_map.insert(
+                relay_a,
+                make_route_conn_info([dst_peer_id], SystemTime::now()),
+            );
+            conn_map.insert(
+                relay_b,
+                make_route_conn_info([dst_peer_id], SystemTime::now()),
+            );
+            conn_map.insert(dst_peer_id, RouteConnInfo::default());
+        }
+
+        let table = RouteTable::new();
+        table.build_from_synced_info(
+            my_peer_id,
+            &synced,
+            NextHopPolicy::LeastHop,
+            &crate::peers::route_trait::DefaultRouteCostCalculator,
+        );
+
+        let mut candidates = table
+            .get_next_hop_candidates(dst_peer_id)
+            .into_iter()
+            .map(|info| info.next_hop_peer_id)
+            .collect::<Vec<_>>();
+        candidates.sort();
+
+        assert_eq!(candidates, vec![relay_a, relay_b]);
+        assert_eq!(
+            table.get_next_hop(dst_peer_id).unwrap().next_hop_peer_id,
+            relay_a
         );
     }
 }

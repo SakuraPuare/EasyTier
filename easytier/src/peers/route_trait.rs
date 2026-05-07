@@ -89,6 +89,17 @@ pub trait Route {
         self.get_next_hop(peer_id).await
     }
 
+    async fn get_next_hop_candidates_with_policy(
+        &self,
+        peer_id: PeerId,
+        policy: NextHopPolicy,
+    ) -> Vec<PeerId> {
+        self.get_next_hop_with_policy(peer_id, policy)
+            .await
+            .into_iter()
+            .collect()
+    }
+
     async fn list_routes(&self) -> Vec<crate::proto::api::instance::Route>;
 
     // TODO: rewrite route management, remove this

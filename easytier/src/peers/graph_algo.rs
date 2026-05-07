@@ -59,6 +59,8 @@ impl<K: PartialOrd, T> Ord for MinScored<K, T> {
 }
 
 pub type DijkstraResult<K, NodeId> = (HashMap<NodeId, K>, HashMap<NodeId, (NodeId, usize)>);
+pub type DijkstraMultiPathResult<K, NodeId> =
+    (HashMap<NodeId, K>, HashMap<NodeId, Vec<(NodeId, usize)>>);
 
 pub fn dijkstra_with_first_hop<G, F, K>(
     graph: G,
@@ -122,6 +124,76 @@ where
     (scores, first_hop)
 }
 
+pub fn dijkstra_with_multi_first_hops<G, F, K>(
+    graph: G,
+    start: G::NodeId,
+    mut edge_cost: F,
+) -> DijkstraMultiPathResult<K, G::NodeId>
+where
+    G: IntoEdges + Visitable,
+    G::NodeId: Eq + Hash + Clone,
+    F: FnMut(G::EdgeRef) -> K,
+    K: Measure + Copy,
+{
+    let mut visited = graph.visit_map();
+    let mut scores = HashMap::new();
+    let mut first_hops = HashMap::new();
+    let mut visit_next = BinaryHeap::new();
+    let zero_score = K::default();
+    scores.insert(start, zero_score);
+    visit_next.push(MinScored(zero_score, start));
+    first_hops.insert(start, vec![(start, 0)]);
+
+    while let Some(MinScored(node_score, node)) = visit_next.pop() {
+        if visited.is_visited(&node) {
+            continue;
+        }
+        for edge in graph.edges(node) {
+            let next = edge.target();
+            if visited.is_visited(&next) {
+                continue;
+            }
+            let next_score = node_score + edge_cost(edge);
+            let hops = if node == start {
+                vec![(next, 1)]
+            } else {
+                first_hops
+                    .get(&node)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(hop, path_len)| (hop, path_len + 1))
+                    .collect()
+            };
+
+            match scores.entry(next) {
+                Occupied(mut ent) => {
+                    if next_score < *ent.get() {
+                        *ent.get_mut() = next_score;
+                        visit_next.push(MinScored(next_score, next));
+                        first_hops.insert(next, hops);
+                    } else if next_score == *ent.get() {
+                        let entry = first_hops.entry(next).or_insert_with(Vec::new);
+                        for hop in hops {
+                            if !entry.contains(&hop) {
+                                entry.push(hop);
+                            }
+                        }
+                    }
+                }
+                Vacant(ent) => {
+                    ent.insert(next_score);
+                    visit_next.push(MinScored(next_score, next));
+                    first_hops.insert(next, hops);
+                }
+            }
+        }
+        visited.visit(node);
+    }
+
+    (scores, first_hops)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +244,49 @@ mod tests {
         assert_eq!(first_hop[&c], (c, 1));
         assert_eq!(first_hop[&d], (b, 2)); // d is reached via b
         assert_eq!(first_hop[&e], (b, 3)); // e is reached via d
+    }
+
+    #[test]
+    fn test_dijkstra_with_multi_first_hops_keeps_equal_cost_hops() {
+        let mut graph = DiGraph::<&str, u32>::new();
+        let a = graph.add_node("a");
+        let b = graph.add_node("b");
+        let c = graph.add_node("c");
+        let d = graph.add_node("d");
+        let e = graph.add_node("e");
+
+        graph.extend_with_edges([
+            (a, b, 1),
+            (a, c, 1),
+            (b, d, 1),
+            (c, d, 1),
+            (a, e, 1),
+            (e, d, 4),
+        ]);
+
+        let (scores, first_hops) = dijkstra_with_multi_first_hops(&graph, a, |edge| *edge.weight());
+
+        assert_eq!(scores[&d], 2);
+
+        let mut hops = first_hops[&d].clone();
+        hops.sort_by_key(|(hop, path_len)| (*path_len, *hop));
+
+        assert_eq!(hops, vec![(b, 2), (c, 2)]);
+    }
+
+    #[test]
+    fn test_dijkstra_with_multi_first_hops_replaces_worse_hops() {
+        let mut graph = DiGraph::<&str, u32>::new();
+        let a = graph.add_node("a");
+        let b = graph.add_node("b");
+        let c = graph.add_node("c");
+        let d = graph.add_node("d");
+
+        graph.extend_with_edges([(a, b, 1), (b, d, 1), (a, c, 1), (c, d, 3)]);
+
+        let (scores, first_hops) = dijkstra_with_multi_first_hops(&graph, a, |edge| *edge.weight());
+
+        assert_eq!(scores[&d], 2);
+        assert_eq!(first_hops[&d], vec![(b, 2)]);
     }
 }
