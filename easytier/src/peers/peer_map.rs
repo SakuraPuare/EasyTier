@@ -190,6 +190,33 @@ impl PeerMap {
         None
     }
 
+    /// Get all equal-cost gateway peer IDs for multi-relay load balancing.
+    pub async fn get_gateway_peer_ids(
+        &self,
+        dst_peer_id: PeerId,
+        policy: NextHopPolicy,
+    ) -> Vec<PeerId> {
+        if dst_peer_id == self.my_peer_id {
+            return vec![dst_peer_id];
+        }
+
+        if self.has_peer(dst_peer_id) && matches!(policy, NextHopPolicy::LeastHop) {
+            return vec![dst_peer_id];
+        }
+
+        // get route info - return all equal-cost next hops
+        for route in self.routes.read().await.iter() {
+            let hops = route
+                .get_next_hops_with_policy(dst_peer_id, policy.clone())
+                .await;
+            if !hops.is_empty() {
+                return hops;
+            }
+        }
+
+        vec![]
+    }
+
     pub async fn list_peers_own_foreign_network(
         &self,
         network_identity: &NetworkIdentity,

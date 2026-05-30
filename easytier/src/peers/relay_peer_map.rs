@@ -1,3 +1,4 @@
+use std::hash::{Hash, Hasher};
 use std::{sync::Arc, time::Instant};
 
 use dashmap::DashMap;
@@ -17,6 +18,78 @@ use crate::{
     proto::peer_rpc::{PeerConnSessionActionPb, RelayNoiseMsg1Pb, RelayNoiseMsg2Pb},
     tunnel::packet_def::{PacketType, ZCPacket},
 };
+
+/// Compute a flow hash from the packet's IP header 5-tuple (src_ip, dst_ip, src_port, dst_port, protocol).
+/// This ensures packets belonging to the same TCP/UDP flow always use the same relay path,
+/// avoiding packet reordering. Falls back to hashing the entire payload for non-IP packets.
+fn compute_flow_hash(msg: &ZCPacket) -> u32 {
+    let payload = msg.payload();
+
+    // Try to extract 5-tuple from IPv4 header
+    // IPv4 header: version(4bits) + ihl(4bits) + ...
+    // Protocol at offset 9, src_ip at 12-15, dst_ip at 16-19
+    if payload.len() >= 20 {
+        let version = (payload[0] >> 4) & 0x0F;
+        if version == 4 {
+            let ihl = ((payload[0] & 0x0F) as usize) * 4;
+            if ihl < 20 || payload.len() < ihl {
+                return hash_payload(payload);
+            }
+            let protocol = payload[9];
+            let src_ip = u32::from_be_bytes([payload[12], payload[13], payload[14], payload[15]]);
+            let dst_ip = u32::from_be_bytes([payload[16], payload[17], payload[18], payload[19]]);
+
+            // TCP=6, UDP=17: extract src/dst ports
+            let (src_port, dst_port) =
+                if payload.len() >= ihl + 4 && (protocol == 6 || protocol == 17) {
+                    let sp = u16::from_be_bytes([payload[ihl], payload[ihl + 1]]);
+                    let dp = u16::from_be_bytes([payload[ihl + 2], payload[ihl + 3]]);
+                    (sp, dp)
+                } else {
+                    (0u16, 0u16)
+                };
+
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            src_ip.hash(&mut hasher);
+            dst_ip.hash(&mut hasher);
+            src_port.hash(&mut hasher);
+            dst_port.hash(&mut hasher);
+            protocol.hash(&mut hasher);
+            return hasher.finish() as u32;
+        } else if version == 6 && payload.len() >= 40 {
+            // IPv6: next header at offset 6, src at 8-23, dst at 24-39
+            let next_header = payload[6];
+            let src_ip_bytes = &payload[8..24];
+            let dst_ip_bytes = &payload[24..40];
+
+            let (src_port, dst_port) =
+                if payload.len() >= 44 && (next_header == 6 || next_header == 17) {
+                    let sp = u16::from_be_bytes([payload[40], payload[41]]);
+                    let dp = u16::from_be_bytes([payload[42], payload[43]]);
+                    (sp, dp)
+                } else {
+                    (0u16, 0u16)
+                };
+
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            src_ip_bytes.hash(&mut hasher);
+            dst_ip_bytes.hash(&mut hasher);
+            src_port.hash(&mut hasher);
+            dst_port.hash(&mut hasher);
+            next_header.hash(&mut hasher);
+            return hasher.finish() as u32;
+        }
+    }
+
+    hash_payload(payload)
+}
+
+/// Fallback: hash the entire payload for non-IP packets.
+fn hash_payload(payload: &[u8]) -> u32 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    payload.hash(&mut hasher);
+    hasher.finish() as u32
+}
 
 const RELAY_NOISE_VERSION: u32 = 1;
 const RELAY_NOISE_PROLOGUE: &[u8] = b"easytier-relay-noise";
@@ -138,7 +211,9 @@ impl RelayPeerMap {
         let mut pkt = ZCPacket::new_with_payload(&payload);
         pkt.fill_peer_manager_hdr(self.my_peer_id, dst_peer_id, packet_type as u8);
         let pkt_len = pkt.buf_len() as u64;
-        self.send_via_next_hop(pkt, dst_peer_id, policy).await?;
+        // Control packets don't need flow-hash based selection
+        self.send_via_next_hop(pkt, dst_peer_id, policy, None)
+            .await?;
         self.control_metrics.record_tx(pkt_len);
         Ok(())
     }
@@ -148,12 +223,37 @@ impl RelayPeerMap {
         msg: ZCPacket,
         dst_peer_id: PeerId,
         policy: NextHopPolicy,
+        flow_hash: Option<u32>,
     ) -> Result<(), Error> {
-        let Some(next_hop) = self.peer_map.get_gateway_peer_id(dst_peer_id, policy).await else {
-            return Err(Error::RouteError(Some(format!(
-                "next hop not found in route for peer {dst_peer_id:?}"
-            ))));
+        let enable_multi_relay = self.global_ctx.get_flags().enable_multi_relay;
+
+        let next_hop = if enable_multi_relay {
+            let next_hops = self
+                .peer_map
+                .get_gateway_peer_ids(dst_peer_id, policy.clone())
+                .await;
+            if next_hops.is_empty() {
+                return Err(Error::RouteError(Some(format!(
+                    "next hop not found in route for peer {dst_peer_id:?}"
+                ))));
+            }
+            if next_hops.len() == 1 || flow_hash.is_none() {
+                next_hops[0]
+            } else {
+                next_hops[(flow_hash.unwrap() as usize) % next_hops.len()]
+            }
+        } else {
+            // Existing single-hop logic
+            self.peer_map
+                .get_gateway_peer_id(dst_peer_id, policy)
+                .await
+                .ok_or_else(|| {
+                    Error::RouteError(Some(format!(
+                        "next hop not found in route for peer {dst_peer_id:?}"
+                    )))
+                })?
         };
+
         if self.peer_map.has_peer(next_hop) {
             self.peer_map.send_msg_directly(msg, next_hop).await
         } else if let Some(foreign_network_client) = &self.foreign_network_client {
@@ -175,6 +275,13 @@ impl RelayPeerMap {
 
         self.states.entry(dst_peer_id).or_default().last_active_at = now;
 
+        // Compute flow hash before encryption (payload is still readable)
+        let flow_hash = if self.global_ctx.get_flags().enable_multi_relay {
+            Some(compute_flow_hash(&msg))
+        } else {
+            None
+        };
+
         if self.is_secure_mode_enabled() {
             match self.ensure_session(dst_peer_id, policy.clone()).await {
                 Ok(session) => {
@@ -191,7 +298,8 @@ impl RelayPeerMap {
             }
         }
 
-        self.send_via_next_hop(msg, dst_peer_id, policy).await
+        self.send_via_next_hop(msg, dst_peer_id, policy, flow_hash)
+            .await
     }
 
     fn buffer_pending_packet(&self, dst_peer_id: PeerId, pkt: ZCPacket, policy: NextHopPolicy) {
@@ -216,13 +324,21 @@ impl RelayPeerMap {
         );
 
         for (mut pkt, policy) in packets {
+            // Compute flow hash before encryption
+            let flow_hash = if self.global_ctx.get_flags().enable_multi_relay {
+                Some(compute_flow_hash(&pkt))
+            } else {
+                None
+            };
             if session
                 .encrypt_payload(self.my_peer_id, dst_peer_id, &mut pkt)
                 .is_err()
             {
                 continue;
             }
-            let _ = self.send_via_next_hop(pkt, dst_peer_id, policy).await;
+            let _ = self
+                .send_via_next_hop(pkt, dst_peer_id, policy, flow_hash)
+                .await;
         }
     }
 
