@@ -62,7 +62,6 @@ use crate::{
 
 use super::{
     PeerPacketFilter,
-    graph_algo::dijkstra_with_first_hop,
     peer_rpc::PeerRpcManager,
     public_ipv6::{
         PublicIpv6PeerRouteInfo, PublicIpv6RouteControl, PublicIpv6Service, PublicIpv6SyncTrigger,
@@ -1317,8 +1316,8 @@ struct NextHopInfo {
     path_len: usize, // path includes src and dst.
     version: Version,
 }
-// dst_peer_id -> (next_hop_peer_id, cost, path_len)
-type NextHopMap = DashMap<PeerId, NextHopInfo>;
+// dst_peer_id -> Vec<(next_hop_peer_id, cost, path_len)> for multi-path support
+type NextHopMap = DashMap<PeerId, Vec<NextHopInfo>>;
 
 // computed with SyncedRouteInfo. used to get next hop.
 #[derive(Debug)]
@@ -1348,12 +1347,25 @@ impl RouteTable {
     fn get_next_hop(&self, dst_peer_id: PeerId) -> Option<NextHopInfo> {
         let cur_version = self.next_hop_map_version.get();
         self.next_hop_map.get(&dst_peer_id).and_then(|x| {
-            if x.version >= cur_version {
-                Some(*x)
-            } else {
-                None
-            }
+            x.iter()
+                .filter(|info| info.version >= cur_version)
+                .next()
+                .copied()
         })
+    }
+
+    /// Get all next hops for a destination peer (for multi-relay load balancing).
+    fn get_all_next_hops(&self, dst_peer_id: PeerId) -> Vec<NextHopInfo> {
+        let cur_version = self.next_hop_map_version.get();
+        self.next_hop_map
+            .get(&dst_peer_id)
+            .map(|x| {
+                x.iter()
+                    .filter(|info| info.version >= cur_version)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn peer_reachable(&self, peer_id: PeerId) -> bool {
@@ -1425,8 +1437,10 @@ impl RouteTable {
     fn clean_expired_route_info(&self) {
         let cur_version = self.next_hop_map_version.get();
         self.next_hop_map.retain(|_, v| {
-            // remove next hop map for peers we cannot reach.
-            v.version >= cur_version
+            // Remove expired entries from the vector
+            v.retain(|info| info.version >= cur_version);
+            // Keep the entry only if there are valid next hops
+            !v.is_empty()
         });
         self.peer_infos.retain(|k, _| {
             // remove peer info for peers we cannot reach.
@@ -1512,24 +1526,31 @@ impl RouteTable {
             );
             return;
         }
-        let (costs, next_hops) = dijkstra_with_first_hop(&graph, *start_node, |e| *e.weight());
+        // Use multi-hop variant to collect all equal-cost first hops (ECMP)
+        let (costs, all_first_hops) =
+            super::graph_algo::dijkstra_with_all_first_hops(&graph, *start_node, |e| *e.weight());
 
-        for (dst, (next_hop, path_len)) in next_hops.iter() {
-            let info = NextHopInfo {
-                next_hop_peer_id: *graph.node_weight(*next_hop).unwrap(),
-                path_latency: (*costs.get(dst).unwrap() % AVOID_RELAY_COST) as i32,
-                path_len: { *path_len },
-                version,
-            };
+        for (dst, first_hops) in all_first_hops.iter() {
             let dst_peer_id = *graph.node_weight(*dst).unwrap();
+            let infos: Vec<NextHopInfo> = first_hops
+                .iter()
+                .map(|(next_hop, path_len)| NextHopInfo {
+                    next_hop_peer_id: *graph.node_weight(*next_hop).unwrap(),
+                    path_latency: (*costs.get(dst).unwrap() % AVOID_RELAY_COST) as i32,
+                    path_len: *path_len,
+                    version,
+                })
+                .collect();
+
             self.next_hop_map
                 .entry(dst_peer_id)
                 .and_modify(|x| {
-                    if x.version < version {
-                        *x = info;
+                    // Only update if the stored entries are outdated
+                    if x.first().map_or(true, |e| e.version < version) {
+                        *x = infos.clone();
                     }
                 })
-                .or_insert(info);
+                .or_insert(infos);
         }
 
         self.next_hop_map_version.set_if_larger(version);
@@ -1586,8 +1607,11 @@ impl RouteTable {
         // build peer_infos, ipv4_peer_id_map, cidr_peer_id_map
         // only set map for peers we can reach.
         for item in self.next_hop_map.iter() {
-            if item.version < version {
-                // skip if the next hop entry is outdated. (peer is unreachable)
+            let infos = item.value();
+            // Check if any next hop entry is current
+            let has_current = infos.iter().any(|info| info.version >= version);
+            if !has_current {
+                // skip if all next hop entries are outdated. (peer is unreachable)
                 continue;
             }
 
@@ -1611,8 +1635,9 @@ impl RouteTable {
                     return false;
                 }
                 let old_next_hop = self.get_next_hop(old_peer.peer_id);
-                let new_next_hop = item.value();
-                old_next_hop.is_none() || new_next_hop.path_len < old_next_hop.unwrap().path_len
+                let new_next_hop = infos.first();
+                old_next_hop.is_none()
+                    || new_next_hop.is_some_and(|h| h.path_len < old_next_hop.unwrap().path_len)
             };
 
             if let Some(ipv4_addr) = info.ipv4_addr {
@@ -3920,6 +3945,23 @@ impl Route for PeerRoute {
             .map(|x| x.next_hop_peer_id)
     }
 
+    async fn get_next_hops_with_policy(
+        &self,
+        dst_peer_id: PeerId,
+        policy: NextHopPolicy,
+    ) -> Vec<PeerId> {
+        let route_table = if matches!(policy, NextHopPolicy::LeastCost) {
+            &self.service_impl.route_table_with_cost
+        } else {
+            &self.service_impl.route_table
+        };
+        route_table
+            .get_all_next_hops(dst_peer_id)
+            .iter()
+            .map(|x| x.next_hop_peer_id)
+            .collect()
+    }
+
     async fn list_routes(&self) -> Vec<crate::proto::api::instance::Route> {
         let route_table = &self.service_impl.route_table;
         let route_table_with_cost = &self.service_impl.route_table_with_cost;
@@ -5034,12 +5076,12 @@ mod tests {
 
         service_impl.route_table.next_hop_map.insert(
             replacement_peer_id,
-            NextHopInfo {
+            vec![NextHopInfo {
                 next_hop_peer_id: replacement_peer_id,
                 path_latency: 0,
                 path_len: 1,
                 version: 1,
-            },
+            }],
         );
         service_impl.route_table.next_hop_map_version.set(1);
 
@@ -5204,12 +5246,12 @@ mod tests {
         service_impl.route_table.next_hop_map.clear();
         service_impl.route_table.next_hop_map.insert(
             stale_peer_id,
-            NextHopInfo {
+            vec![NextHopInfo {
                 next_hop_peer_id: stale_peer_id,
                 path_latency: 0,
                 path_len: 1,
                 version: 1,
-            },
+            }],
         );
         service_impl.route_table.next_hop_map_version.set(1);
 
