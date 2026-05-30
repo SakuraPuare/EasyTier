@@ -187,6 +187,9 @@ core_clap:
   enable_udp_broadcast_relay:
     en: "Windows only: capture local UDP broadcast packets from physical interfaces and forward them to EasyTier peers. Helps games to find rooms in local network. Requires administrator privileges."
     zh-CN: "仅 Windows：捕获物理网卡上的本机 UDP 广播包并转发给 EasyTier 对等节点，帮助局域网游戏发现房间。需要管理员权限。"
+  enable_multi_relay:
+    en: "enable multi-relay load balancing: spread traffic across equal-cost relay paths (ECMP), keeping each flow on a single relay to avoid reordering."
+    zh-CN: "启用多中继负载均衡：将流量分散到等价中继路径（ECMP），同一条流固定走同一中继以避免乱序。"
   relay_all_peer_rpc:
     en: "relay all peer rpc packets, even if the peer is not in the relay network whitelist. this can help peers not in relay network whitelist to establish p2p connection."
     zh-CN: "转发所有对等节点的RPC数据包，即使对等节点不在转发网络白名单中。这可以帮助白名单外网络中的对等节点建立P2P连接。"

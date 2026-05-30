@@ -824,6 +824,10 @@ impl NetworkConfig {
             flags.enable_udp_broadcast_relay = enable_udp_broadcast_relay;
         }
 
+        if let Some(enable_multi_relay) = self.enable_multi_relay {
+            flags.enable_multi_relay = enable_multi_relay;
+        }
+
         if let Some(disable_sym_hole_punching) = self.disable_sym_hole_punching {
             flags.disable_sym_hole_punching = disable_sym_hole_punching;
         }
@@ -1000,6 +1004,7 @@ impl NetworkConfig {
         result.disable_upnp = Some(flags.disable_upnp);
         result.disable_relay_data = Some(flags.disable_relay_data);
         result.enable_udp_broadcast_relay = Some(flags.enable_udp_broadcast_relay);
+        result.enable_multi_relay = Some(flags.enable_multi_relay);
         result.disable_sym_hole_punching = Some(flags.disable_sym_hole_punching);
         result.enable_magic_dns = Some(flags.accept_dns);
         result.mtu = Some(flags.mtu as i32);
