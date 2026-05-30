@@ -73,6 +73,7 @@ pub fn gen_default_flags() -> Flags {
         disable_upnp: false,
         disable_relay_data: false,
         enable_udp_broadcast_relay: false,
+        enable_multi_relay: false,
     }
 }
 

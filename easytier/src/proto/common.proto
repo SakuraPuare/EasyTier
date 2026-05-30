@@ -77,6 +77,9 @@ message FlagsInConfig {
   bool disable_upnp = 40;
   bool disable_relay_data = 41;
   bool enable_udp_broadcast_relay = 42;
+
+  // Enable multi-relay load balancing across equal-cost paths
+  bool enable_multi_relay = 43;
 }
 
 message RpcDescriptor {
