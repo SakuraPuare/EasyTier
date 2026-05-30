@@ -89,6 +89,19 @@ pub trait Route {
         self.get_next_hop(peer_id).await
     }
 
+    /// Get all equal-cost next hops for multi-relay load balancing.
+    /// Default implementation returns single next hop for backward compatibility.
+    async fn get_next_hops_with_policy(
+        &self,
+        peer_id: PeerId,
+        policy: NextHopPolicy,
+    ) -> Vec<PeerId> {
+        self.get_next_hop_with_policy(peer_id, policy)
+            .await
+            .into_iter()
+            .collect()
+    }
+
     async fn list_routes(&self) -> Vec<crate::proto::api::instance::Route>;
 
     // TODO: rewrite route management, remove this
