@@ -156,39 +156,37 @@ where
                 continue;
             }
             let next_score = node_score + edge_cost(edge);
+            // Build the inherited first-hop set: if `node` is the start, `next` is itself
+            // a first hop; otherwise inherit ALL of the predecessor's equal-cost first hops.
+            let inherited: Vec<(G::NodeId, usize)> = if node == start {
+                vec![(next, 1)]
+            } else {
+                first_hops
+                    .get(&node)
+                    .map(|h| h.iter().map(|(id, len)| (id.clone(), len + 1)).collect())
+                    .unwrap_or_else(|| vec![(next, 1)])
+            };
             match scores.entry(next) {
                 Occupied(mut ent) => {
                     if next_score < *ent.get() {
-                        // Found a better path, replace
+                        // Found a strictly better path, replace all alternatives.
                         *ent.get_mut() = next_score;
                         visit_next.push(MinScored(next_score, next));
-                        let hop = if node == start {
-                            (next, 0)
-                        } else {
-                            // Inherit first_hops from predecessor
-                            first_hops.get(&node).and_then(|h| h.first().copied()).unwrap_or((next, 0))
-                        };
-                        first_hops.insert(next, vec![(hop.0, hop.1 + 1)]);
+                        first_hops.insert(next, inherited);
                     } else if next_score == *ent.get() {
-                        // Found an equal-cost path, add as alternative
-                        let hop = if node == start {
-                            (next, 0)
-                        } else {
-                            first_hops.get(&node).and_then(|h| h.first().copied()).unwrap_or((next, 0))
-                        };
-                        let new_first_hop = (hop.0, hop.1 + 1);
-                        first_hops.entry(next).or_default().push(new_first_hop);
+                        // Equal-cost path: merge in new first hops, deduping by hop id.
+                        let entry = first_hops.entry(next).or_default();
+                        for hop in inherited {
+                            if !entry.iter().any(|(id, _)| *id == hop.0) {
+                                entry.push(hop);
+                            }
+                        }
                     }
                 }
                 Vacant(ent) => {
                     ent.insert(next_score);
                     visit_next.push(MinScored(next_score, next));
-                    let hop = if node == start {
-                        (next, 0)
-                    } else {
-                        first_hops.get(&node).and_then(|h| h.first().copied()).unwrap_or((next, 0))
-                    };
-                    first_hops.insert(next, vec![(hop.0, hop.1 + 1)]);
+                    first_hops.insert(next, inherited);
                 }
             }
         }
@@ -342,5 +340,33 @@ mod tests {
         let hop_ids: Vec<_> = first_hops[&d].iter().map(|(id, _)| *id).collect();
         assert!(hop_ids.contains(&b));
         assert!(hop_ids.contains(&c));
+    }
+
+    #[test]
+    fn test_dijkstra_with_all_first_hops_two_hop_diamond() {
+        // a -> b -> m -> d and a -> c -> m -> d (all edges cost 1).
+        // d is two hops past the branch point; both b and c must survive.
+        let mut graph = DiGraph::<&str, u32>::new();
+        let a = graph.add_node("a");
+        let b = graph.add_node("b");
+        let c = graph.add_node("c");
+        let m = graph.add_node("m");
+        let d = graph.add_node("d");
+
+        graph.extend_with_edges([(a, b, 1), (a, c, 1), (b, m, 1), (c, m, 1), (m, d, 1)]);
+
+        let (scores, first_hops) = dijkstra_with_all_first_hops(&graph, a, |edge| *edge.weight());
+
+        assert_eq!(scores[&d], 3);
+        let m_hops: Vec<_> = first_hops[&m].iter().map(|(id, _)| *id).collect();
+        assert_eq!(m_hops.len(), 2);
+        assert!(m_hops.contains(&b));
+        assert!(m_hops.contains(&c));
+        // d inherits both equal-cost first hops through m.
+        let d_hops: Vec<_> = first_hops[&d].iter().map(|(id, _)| *id).collect();
+        assert_eq!(d_hops.len(), 2);
+        assert!(d_hops.contains(&b));
+        assert!(d_hops.contains(&c));
+        assert!(first_hops[&d].iter().all(|(_, len)| *len == 3));
     }
 }
