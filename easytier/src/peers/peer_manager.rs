@@ -1513,7 +1513,19 @@ impl PeerManager {
         } else if foreign_network_client.has_next_hop(dst_peer_id) {
             foreign_network_client.send_msg(msg, dst_peer_id).await
         } else if let Some(gateway) = peers.get_gateway_peer_id(dst_peer_id, policy.clone()).await {
-            if peers.has_peer(gateway) || foreign_network_client.has_next_hop(gateway) {
+            // With multi-relay enabled the relay layer balances over (and validates
+            // reachability of) all equal-cost gateways, so admit if ANY is reachable;
+            // otherwise the single representative gateway must be reachable.
+            let reachable = if relay_peer_map.is_multi_relay_enabled() {
+                peers
+                    .get_gateway_peer_ids(dst_peer_id, policy.clone())
+                    .await
+                    .into_iter()
+                    .any(|g| peers.has_peer(g) || foreign_network_client.has_next_hop(g))
+            } else {
+                peers.has_peer(gateway) || foreign_network_client.has_next_hop(gateway)
+            };
+            if reachable {
                 relay_peer_map.send_msg(msg, dst_peer_id, policy).await
             } else {
                 tracing::warn!(

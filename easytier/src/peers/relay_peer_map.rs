@@ -165,6 +165,10 @@ impl RelayPeerMap {
         self.is_secure_mode_enabled
     }
 
+    pub fn is_multi_relay_enabled(&self) -> bool {
+        self.global_ctx.get_flags().enable_multi_relay
+    }
+
     fn get_local_keypair(&self) -> Result<(Vec<u8>, Vec<u8>), Error> {
         let cfg = self
             .global_ctx
@@ -232,15 +236,27 @@ impl RelayPeerMap {
                 .peer_map
                 .get_gateway_peer_ids(dst_peer_id, policy.clone())
                 .await;
-            if next_hops.is_empty() {
+            // Only balance over hops this node can actually forward to, so the
+            // flow-hash pick never lands on an unreachable relay.
+            let reachable: Vec<PeerId> = next_hops
+                .into_iter()
+                .filter(|hop| {
+                    self.peer_map.has_peer(*hop)
+                        || self
+                            .foreign_network_client
+                            .as_ref()
+                            .map_or(false, |c| c.has_next_hop(*hop))
+                })
+                .collect();
+            if reachable.is_empty() {
                 return Err(Error::RouteError(Some(format!(
                     "next hop not found in route for peer {dst_peer_id:?}"
                 ))));
             }
-            if next_hops.len() == 1 || flow_hash.is_none() {
-                next_hops[0]
+            if reachable.len() == 1 || flow_hash.is_none() {
+                reachable[0]
             } else {
-                next_hops[(flow_hash.unwrap() as usize) % next_hops.len()]
+                reachable[(flow_hash.unwrap() as usize) % reachable.len()]
             }
         } else {
             // Existing single-hop logic

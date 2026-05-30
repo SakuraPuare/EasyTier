@@ -1532,7 +1532,7 @@ impl RouteTable {
 
         for (dst, first_hops) in all_first_hops.iter() {
             let dst_peer_id = *graph.node_weight(*dst).unwrap();
-            let infos: Vec<NextHopInfo> = first_hops
+            let mut infos: Vec<NextHopInfo> = first_hops
                 .iter()
                 .map(|(next_hop, path_len)| NextHopInfo {
                     next_hop_peer_id: *graph.node_weight(*next_hop).unwrap(),
@@ -1541,6 +1541,9 @@ impl RouteTable {
                     version,
                 })
                 .collect();
+            // Sort by peer id so the representative hop (get_next_hop / next_hops[0])
+            // is stable across rebuilds of an identical topology.
+            infos.sort_by_key(|info| info.next_hop_peer_id);
 
             self.next_hop_map
                 .entry(dst_peer_id)
