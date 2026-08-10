@@ -494,6 +494,15 @@ struct NetworkOptions {
 
     #[arg(
         long,
+        env = "ET_ENABLE_MULTI_RELAY",
+        help = t!("core_clap.enable_multi_relay").to_string(),
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    enable_multi_relay: Option<bool>,
+
+    #[arg(
+        long,
         env = "ET_RELAY_ALL_PEER_RPC",
         help = t!("core_clap.relay_all_peer_rpc").to_string(),
         num_args = 0..=1,
@@ -1171,6 +1180,9 @@ impl NetworkOptions {
         f.enable_udp_broadcast_relay = self
             .enable_udp_broadcast_relay
             .unwrap_or(f.enable_udp_broadcast_relay);
+        f.enable_multi_relay = self
+            .enable_multi_relay
+            .unwrap_or(f.enable_multi_relay);
         // Configure tld_dns_zone: use provided value if set
         if let Some(tld_dns_zone) = &self.tld_dns_zone {
             f.tld_dns_zone = tld_dns_zone.clone();

@@ -72,7 +72,6 @@ use crate::{
 use super::{
     DefaultRouteCostCalculator, ForeignNetworkRouteInfoMap, NextHopPolicy, Route,
     RouteCostCalculator, RouteCostCalculatorInterface, RouteInterfaceBox,
-    graph_algo::dijkstra_with_first_hop,
     route_peer_wire::{
         self, RawRoutePeerInfo, extract_route_peer_infos, patch_credential_route_peer_info,
         raw_credential_bytes, raw_route_peer_info,
@@ -210,7 +209,7 @@ pub struct OspfNextHopInfo {
     pub version: Version,
 }
 
-type NextHopMap = DashMap<PeerId, OspfNextHopInfo>;
+type NextHopMap = DashMap<PeerId, Vec<OspfNextHopInfo>>;
 
 // computed with SyncedRouteInfo snapshot. used to get next hop.
 #[derive(Debug)]
@@ -246,14 +245,28 @@ impl OspfRouteTable {
         self.get_topology_next_hop(dst_peer_id)
     }
 
+    pub fn get_all_next_hops(&self, dst_peer_id: PeerId) -> Vec<OspfNextHopInfo> {
+        if self.suppressed_peer_ids.contains_key(&dst_peer_id) {
+            return vec![];
+        }
+        let cur_version = self.next_hop_map_version.get();
+        self.next_hop_map
+            .get(&dst_peer_id)
+            .map(|x| {
+                x.iter()
+                    .filter(|info| info.version >= cur_version)
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn get_topology_next_hop(&self, dst_peer_id: PeerId) -> Option<OspfNextHopInfo> {
         let cur_version = self.next_hop_map_version.get();
         self.next_hop_map.get(&dst_peer_id).and_then(|x| {
-            if x.version >= cur_version {
-                Some(*x)
-            } else {
-                None
-            }
+            x.iter()
+                .find(|info| info.version >= cur_version)
+                .copied()
         })
     }
 
@@ -353,8 +366,7 @@ impl OspfRouteTable {
     pub fn clean_expired_route_info(&self) {
         let cur_version = self.next_hop_map_version.get();
         self.next_hop_map.retain(|_, v| {
-            // remove next hop map for peers we cannot reach.
-            v.version >= cur_version
+            v.first().map_or(false, |e| e.version >= cur_version)
         });
         self.peer_infos.retain(|k, _| {
             // remove peer info for peers we cannot forward to.
@@ -441,24 +453,30 @@ impl OspfRouteTable {
             );
             return;
         }
-        let (costs, next_hops) = dijkstra_with_first_hop(graph, *start_node, |e| *e.weight());
+        let (costs, all_first_hops) =
+            super::graph_algo::dijkstra_with_all_first_hops(graph, *start_node, |e| *e.weight());
 
-        for (dst, (next_hop, path_len)) in next_hops.iter() {
-            let info = OspfNextHopInfo {
-                next_hop_peer_id: *graph.node_weight(*next_hop).unwrap(),
-                path_latency: (*costs.get(dst).unwrap() % AVOID_RELAY_COST) as i32,
-                path_len: *path_len,
-                version,
-            };
+        for (dst, first_hops) in all_first_hops.iter() {
             let dst_peer_id = *graph.node_weight(*dst).unwrap();
+            let mut infos: Vec<OspfNextHopInfo> = first_hops
+                .iter()
+                .map(|(next_hop, path_len)| OspfNextHopInfo {
+                    next_hop_peer_id: *graph.node_weight(*next_hop).unwrap(),
+                    path_latency: (*costs.get(dst).unwrap() % AVOID_RELAY_COST) as i32,
+                    path_len: *path_len,
+                    version,
+                })
+                .collect();
+            infos.sort_by_key(|info| info.next_hop_peer_id);
+
             self.next_hop_map
                 .entry(dst_peer_id)
                 .and_modify(|x| {
-                    if x.version < version {
-                        *x = info;
+                    if x.first().map_or(true, |e| e.version < version) {
+                        *x = infos.clone();
                     }
                 })
-                .or_insert(info);
+                .or_insert(infos);
         }
 
         self.next_hop_map_version.set_if_larger(version);
@@ -515,7 +533,7 @@ impl OspfRouteTable {
         // build peer_infos, ipv4_peer_id_map, cidr_peer_id_map
         // only set map for peers we can reach.
         for item in self.next_hop_map.iter() {
-            if item.version < version {
+            if item.first().map_or(true, |e| e.version < version) {
                 // skip if the next hop entry is outdated. (peer is unreachable)
                 continue;
             }
@@ -544,8 +562,10 @@ impl OspfRouteTable {
                     return false;
                 }
                 let old_next_hop = self.get_next_hop(old_peer.peer_id);
-                let new_next_hop = item.value();
-                old_next_hop.is_none() || new_next_hop.path_len < old_next_hop.unwrap().path_len
+                let new_next_hop = item.value().first();
+                old_next_hop.is_none()
+                    || new_next_hop
+                        .is_some_and(|n| n.path_len < old_next_hop.unwrap().path_len)
             };
 
             if let Some(ipv4_addr) = info.ipv4_addr {
@@ -4310,6 +4330,23 @@ impl Route for PeerRoute {
         route_table
             .get_next_hop(dst_peer_id)
             .map(|x| x.next_hop_peer_id)
+    }
+
+    async fn get_next_hops_with_policy(
+        &self,
+        dst_peer_id: PeerId,
+        policy: NextHopPolicy,
+    ) -> Vec<PeerId> {
+        let route_table = if matches!(policy, NextHopPolicy::LeastCost) {
+            &self.service_impl.route_table_with_cost
+        } else {
+            &self.service_impl.route_table
+        };
+        route_table
+            .get_all_next_hops(dst_peer_id)
+            .iter()
+            .map(|x| x.next_hop_peer_id)
+            .collect()
     }
 
     async fn list_routes(&self) -> Vec<CoreRouteInfo> {

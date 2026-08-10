@@ -84,6 +84,10 @@ message FlagsInConfig {
   // applied via setsockopt. Requires CAP_NET_ADMIN; silently ignored on
   // non-Linux platforms.
   optional uint32 socket_mark = 43;
+
+  // Enable multi-relay load balancing: distribute flows across all equal-cost
+  // relay paths instead of picking a single best one.
+  bool enable_multi_relay = 44;
 }
 
 message RpcDescriptor {

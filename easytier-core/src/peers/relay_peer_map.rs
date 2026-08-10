@@ -1,3 +1,4 @@
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -61,6 +62,48 @@ pub struct RelayPeerMap {
     pub(crate) pending_packets: DashMap<PeerId, Vec<(ZCPacket, NextHopPolicy)>>,
 
     is_secure_mode_enabled: bool,
+    enable_multi_relay: bool,
+}
+
+fn compute_flow_hash(payload: &[u8]) -> u64 {
+    // Try to extract 5-tuple from IPv4/IPv6 header in payload
+    if payload.len() < 20 {
+        return 0;
+    }
+    let version = (payload[0] >> 4) & 0xf;
+    let mut hasher = std::hash::DefaultHasher::new();
+    match version {
+        4 => {
+            // IPv4: src(12..16), dst(16..20), proto(9)
+            if payload.len() < 20 {
+                return 0;
+            }
+            let proto = payload[9];
+            payload[12..16].hash(&mut hasher);
+            payload[16..20].hash(&mut hasher);
+            proto.hash(&mut hasher);
+            let ihl = ((payload[0] & 0xf) as usize) * 4;
+            if (proto == 6 || proto == 17) && payload.len() >= ihl + 4 {
+                // src_port + dst_port
+                payload[ihl..ihl + 4].hash(&mut hasher);
+            }
+        }
+        6 => {
+            // IPv6: src(8..24), dst(24..40), next_header(6)
+            if payload.len() < 40 {
+                return 0;
+            }
+            let next_header = payload[6];
+            payload[8..24].hash(&mut hasher);
+            payload[24..40].hash(&mut hasher);
+            next_header.hash(&mut hasher);
+            if (next_header == 6 || next_header == 17) && payload.len() >= 44 {
+                payload[40..44].hash(&mut hasher);
+            }
+        }
+        _ => return 0,
+    }
+    hasher.finish()
 }
 
 #[async_trait::async_trait]
@@ -74,6 +117,16 @@ pub trait RelayRouteTransport: Send + Sync {
         dst_peer_id: PeerId,
         policy: NextHopPolicy,
     ) -> Result<(), Error>;
+
+    async fn get_gateway_peer_ids(
+        &self,
+        dst_peer_id: PeerId,
+        policy: NextHopPolicy,
+    ) -> Vec<PeerId>;
+
+    async fn send_msg_to_peer(&self, msg: ZCPacket, peer_id: PeerId) -> Result<(), Error>;
+
+    fn has_peer(&self, peer_id: PeerId) -> bool;
 }
 
 pub struct PeerMapRelayRouteTransport {
@@ -108,6 +161,36 @@ impl RelayRouteTransport for PeerMapRelayRouteTransport {
             ))))
         }
     }
+
+    async fn get_gateway_peer_ids(
+        &self,
+        dst_peer_id: PeerId,
+        policy: NextHopPolicy,
+    ) -> Vec<PeerId> {
+        self.peer_map
+            .get_gateway_peer_ids(dst_peer_id, policy)
+            .await
+    }
+
+    async fn send_msg_to_peer(&self, msg: ZCPacket, peer_id: PeerId) -> Result<(), Error> {
+        if self.peer_map.has_peer(peer_id) {
+            self.peer_map.send_msg_directly(msg, peer_id).await
+        } else if let Some(foreign_network_client) = &self.foreign_network_client {
+            foreign_network_client.send_msg(msg, peer_id).await
+        } else {
+            Err(Error::RouteError(Some(format!(
+                "peer not reachable: {peer_id:?}"
+            ))))
+        }
+    }
+
+    fn has_peer(&self, peer_id: PeerId) -> bool {
+        self.peer_map.has_peer(peer_id)
+            || self
+                .foreign_network_client
+                .as_ref()
+                .is_some_and(|c| c.has_next_hop(peer_id))
+    }
 }
 
 pub fn new_relay_peer_map(
@@ -139,6 +222,7 @@ impl RelayPeerMap {
             .secure_mode()
             .map(|cfg| cfg.enabled)
             .unwrap_or(false);
+        let enable_multi_relay = context.flags().enable_multi_relay;
         let metric_network_name = context.network_name();
         Arc::new(Self {
             route_transport,
@@ -151,6 +235,7 @@ impl RelayPeerMap {
             handshake_locks: DashMap::new(),
             pending_packets: DashMap::new(),
             is_secure_mode_enabled,
+            enable_multi_relay,
         })
     }
 
@@ -218,9 +303,44 @@ impl RelayPeerMap {
         dst_peer_id: PeerId,
         policy: NextHopPolicy,
     ) -> Result<(), Error> {
-        self.route_transport
-            .send_msg_to_next_hop(msg, dst_peer_id, policy)
-            .await
+        if !self.enable_multi_relay {
+            return self
+                .route_transport
+                .send_msg_to_next_hop(msg, dst_peer_id, policy)
+                .await;
+        }
+
+        // Multi-relay: get all gateways, filter reachable, flow-hash select
+        let gateways = self
+            .route_transport
+            .get_gateway_peer_ids(dst_peer_id, policy.clone())
+            .await;
+
+        let reachable: Vec<PeerId> = gateways
+            .into_iter()
+            .filter(|id| self.route_transport.has_peer(*id))
+            .collect();
+
+        if reachable.is_empty() {
+            return self
+                .route_transport
+                .send_msg_to_next_hop(msg, dst_peer_id, policy)
+                .await;
+        }
+
+        if reachable.len() == 1 {
+            return self
+                .route_transport
+                .send_msg_to_peer(msg, reachable[0])
+                .await;
+        }
+
+        // Compute flow hash from payload (before encryption layer, payload is inner packet)
+        let flow_hash = compute_flow_hash(msg.payload());
+        let idx = (flow_hash as usize) % reachable.len();
+        let selected = reachable[idx];
+
+        self.route_transport.send_msg_to_peer(msg, selected).await
     }
 
     pub async fn send_msg(
@@ -840,6 +960,22 @@ mod tests {
                 .and_then(Weak::upgrade)
                 .ok_or_else(|| Error::RouteError(Some("test relay is unavailable".to_owned())))?;
             remote.handle_handshake_packet(msg).await
+        }
+
+        async fn get_gateway_peer_ids(
+            &self,
+            _dst_peer_id: PeerId,
+            _policy: NextHopPolicy,
+        ) -> Vec<PeerId> {
+            vec![]
+        }
+
+        async fn send_msg_to_peer(&self, _msg: ZCPacket, _peer_id: PeerId) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn has_peer(&self, _peer_id: PeerId) -> bool {
+            false
         }
     }
 
