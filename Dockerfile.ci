@@ -1,0 +1,24 @@
+# Stage 1: Build with musl (static binary, official method)
+FROM registry.sakurapuare.com/dockerhub/library/rust:1.97-alpine AS builder
+WORKDIR /src
+
+RUN apk add --no-cache musl-dev protobuf-dev pkgconfig openssl-dev openssl-libs-static perl make
+
+COPY . .
+
+RUN cargo build --release --target x86_64-unknown-linux-musl \
+    --features=jemalloc -p easytier \
+    && strip target/x86_64-unknown-linux-musl/release/easytier-core \
+              target/x86_64-unknown-linux-musl/release/easytier-cli
+
+# Stage 2: Runtime image
+FROM registry.sakurapuare.com/dockerhub/library/alpine:latest
+RUN apk add --no-cache tzdata tini
+WORKDIR /app
+COPY --from=builder /src/target/x86_64-unknown-linux-musl/release/easytier-core /usr/local/bin/
+COPY --from=builder /src/target/x86_64-unknown-linux-musl/release/easytier-cli /usr/local/bin/
+ENV TZ=Asia/Shanghai
+EXPOSE 11010/tcp 11010/udp 11011/udp 11011/tcp 11012/tcp
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=5 \
+    CMD ["/usr/local/bin/easytier-cli", "--rpc-portal", "127.0.0.1:15888", "--output", "json", "node", "info"]
+ENTRYPOINT ["/sbin/tini", "--", "easytier-core"]

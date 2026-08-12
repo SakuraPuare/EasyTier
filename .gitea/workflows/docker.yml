@@ -1,0 +1,51 @@
+name: Build & Push Docker Image
+
+on:
+  push:
+    branches: [main, feat/multi-relay-v2]
+    paths:
+      - 'easytier/**'
+      - 'easytier-core/**'
+      - 'easytier-proto/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Dockerfile.ci'
+  workflow_dispatch:
+
+env:
+  REGISTRY: registry.sakurapuare.com
+  IMAGE: registry.sakurapuare.com/easytier/easytier
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Login to Harbor
+        run: |
+          echo "${{ secrets.HARBOR_PASS }}" | docker login $REGISTRY -u ${{ secrets.HARBOR_USER }} --password-stdin
+
+      - name: Build image
+        run: |
+          docker build -f Dockerfile.ci -t $IMAGE:${GITHUB_SHA::8} .
+
+      - name: Determine tags
+        id: tags
+        run: |
+          SHA_TAG=${GITHUB_SHA::8}
+          BRANCH=${GITHUB_REF_NAME}
+          if [ "$BRANCH" = "main" ]; then
+            echo "tags=$IMAGE:$SHA_TAG $IMAGE:latest" >> $GITHUB_OUTPUT
+          else
+            # Use branch name as tag (replace / with -)
+            BRANCH_TAG=$(echo "$BRANCH" | sed 's|/|-|g; s|feat-||')
+            echo "tags=$IMAGE:$SHA_TAG $IMAGE:$BRANCH_TAG" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Tag and push
+        run: |
+          for tag in ${{ steps.tags.outputs.tags }}; do
+            docker tag $IMAGE:${GITHUB_SHA::8} $tag
+            docker push $tag
+          done
