@@ -1,0 +1,36 @@
+# ============================================================
+# EasyTier CI Dockerfile — cargo-chef pattern for fast rebuilds
+# Stage 1: Plan (extract dependency info)
+# Stage 2: Cook (build deps only — cached if Cargo.lock unchanged)
+# Stage 3: Build (only project crates recompile)
+# ============================================================
+
+FROM registry.sakurapuare.com/dockerhub/library/rust:1.97-alpine AS chef
+RUN apk add --no-cache musl-dev protobuf-dev pkgconfig openssl-dev openssl-libs-static perl make
+RUN cargo install cargo-chef --locked
+WORKDIR /src
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /src/recipe.json recipe.json
+RUN cargo chef cook --release --target x86_64-unknown-linux-musl \
+    --features=jemalloc -p easytier --recipe-path recipe.json
+COPY . .
+RUN cargo build --release --target x86_64-unknown-linux-musl \
+    --features=jemalloc -p easytier \
+    && strip target/x86_64-unknown-linux-musl/release/easytier-core \
+              target/x86_64-unknown-linux-musl/release/easytier-cli
+
+FROM registry.sakurapuare.com/dockerhub/library/alpine:latest
+RUN apk add --no-cache tzdata tini
+WORKDIR /app
+COPY --from=builder /src/target/x86_64-unknown-linux-musl/release/easytier-core /usr/local/bin/
+COPY --from=builder /src/target/x86_64-unknown-linux-musl/release/easytier-cli /usr/local/bin/
+ENV TZ=Asia/Shanghai
+EXPOSE 11010/tcp 11010/udp 11011/udp 11011/tcp 11012/tcp
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=5 \
+    CMD ["/usr/local/bin/easytier-cli", "--rpc-portal", "127.0.0.1:15888", "--output", "json", "node", "info"]
+ENTRYPOINT ["/sbin/tini", "--", "easytier-core"]
