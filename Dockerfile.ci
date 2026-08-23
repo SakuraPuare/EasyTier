@@ -6,7 +6,7 @@
 # ============================================================
 
 FROM registry.sakurapuare.com/dockerhub/library/rust:1.97-alpine AS chef
-RUN apk add --no-cache musl-dev protobuf-dev pkgconfig openssl-dev openssl-libs-static perl make
+RUN apk add --no-cache musl-dev protobuf-dev pkgconfig openssl-dev openssl-libs-static perl make clang-dev
 RUN cargo install cargo-chef --locked
 WORKDIR /src
 
