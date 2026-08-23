@@ -1,14 +1,17 @@
 # ============================================================
 # EasyTier CI Dockerfile
-# Uses BuildKit cache mount for cargo registry + target dir
-# to avoid re-downloading/re-compiling unchanged dependencies.
+# Builder: Debian (glibc) for bindgen/libclang dlopen support
+# Target: x86_64-unknown-linux-musl (static binary)
+# Runtime: Alpine (minimal)
+# Uses BuildKit cache mounts for fast incremental builds.
 # ============================================================
 
-FROM registry.sakurapuare.com/dockerhub/library/rust:1.97-alpine AS builder
-RUN apk add --no-cache musl-dev protobuf-dev pkgconfig openssl-dev openssl-libs-static perl make \
-    clang-dev clang-static llvm-dev
-ENV LIBCLANG_PATH=/usr/lib/llvm22/lib
-ENV LIBCLANG_STATIC=1
+FROM registry.sakurapuare.com/dockerhub/library/rust:1.97-bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    musl-tools musl-dev protobuf-compiler pkg-config \
+    libssl-dev libclang-dev perl make \
+    && rm -rf /var/lib/apt/lists/*
+RUN rustup target add x86_64-unknown-linux-musl
 WORKDIR /src
 
 COPY . .
