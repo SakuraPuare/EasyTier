@@ -1,17 +1,13 @@
 # ============================================================
 # EasyTier CI Dockerfile
-# Builder: Debian (glibc) for bindgen/libclang dlopen support
-# Target: x86_64-unknown-linux-musl (static binary)
-# Runtime: Alpine (minimal)
+# Native glibc build (no cross-compile complexity)
 # Uses BuildKit cache mounts for fast incremental builds.
 # ============================================================
 
 FROM registry.sakurapuare.com/dockerhub/library/rust:1.97-bookworm AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    musl-tools musl-dev protobuf-compiler pkg-config \
-    libssl-dev libclang-dev perl make \
+    protobuf-compiler pkg-config libssl-dev libclang-dev perl make \
     && rm -rf /var/lib/apt/lists/*
-RUN rustup target add x86_64-unknown-linux-musl
 WORKDIR /src
 
 COPY . .
@@ -19,14 +15,15 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
-    cargo build --release --target x86_64-unknown-linux-musl \
-    --features=jemalloc -p easytier \
-    && cp target/x86_64-unknown-linux-musl/release/easytier-core /tmp/ \
-    && cp target/x86_64-unknown-linux-musl/release/easytier-cli /tmp/ \
+    cargo build --release --features=jemalloc -p easytier \
+    && cp target/release/easytier-core /tmp/ \
+    && cp target/release/easytier-cli /tmp/ \
     && strip /tmp/easytier-core /tmp/easytier-cli
 
-FROM registry.sakurapuare.com/dockerhub/library/alpine:latest
-RUN apk add --no-cache tzdata tini
+FROM registry.sakurapuare.com/dockerhub/library/debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates tini \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=builder /tmp/easytier-core /usr/local/bin/
 COPY --from=builder /tmp/easytier-cli /usr/local/bin/
@@ -34,4 +31,4 @@ ENV TZ=Asia/Shanghai
 EXPOSE 11010/tcp 11010/udp 11011/udp 11011/tcp 11012/tcp
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=5 \
     CMD ["/usr/local/bin/easytier-cli", "--rpc-portal", "127.0.0.1:15888", "--output", "json", "node", "info"]
-ENTRYPOINT ["/sbin/tini", "--", "easytier-core"]
+ENTRYPOINT ["tini", "--", "easytier-core"]
