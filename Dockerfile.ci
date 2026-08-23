@@ -6,7 +6,10 @@
 # ============================================================
 
 FROM registry.sakurapuare.com/dockerhub/library/rust:1.97-alpine AS chef
-RUN apk add --no-cache musl-dev protobuf-dev pkgconfig openssl-dev openssl-libs-static perl make clang-dev
+RUN apk add --no-cache musl-dev protobuf-dev pkgconfig openssl-dev openssl-libs-static perl make \
+    clang-dev clang-static llvm-dev
+ENV LIBCLANG_PATH=/usr/lib/llvm22/lib
+ENV LIBCLANG_STATIC=1
 RUN cargo install cargo-chef --locked
 WORKDIR /src
 
