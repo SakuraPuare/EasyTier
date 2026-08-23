@@ -6,7 +6,7 @@
 
 FROM registry.sakurapuare.com/dockerhub/library/rust:1.97-bookworm AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    protobuf-compiler pkg-config libssl-dev libclang-dev perl make \
+    protobuf-compiler pkg-config libssl-dev libclang-dev perl make mold \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 
