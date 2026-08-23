@@ -1,32 +1,51 @@
 # ============================================================
-# EasyTier CI Dockerfile — cargo-chef pattern for fast rebuilds
-# Stage 1: Plan (extract dependency info)
-# Stage 2: Cook (build deps only — cached if Cargo.lock unchanged)
-# Stage 3: Build (only project crates recompile)
+# EasyTier CI Dockerfile — optimized layer caching
+# Layer 1: Install system deps + download crate registry
+# Layer 2: Fetch all dependencies (cached if Cargo.lock unchanged)
+# Layer 3: Build project (only this layer reruns on source change)
 # ============================================================
 
-FROM registry.sakurapuare.com/dockerhub/library/rust:1.97-alpine AS chef
+FROM registry.sakurapuare.com/dockerhub/library/rust:1.97-alpine AS builder
 RUN apk add --no-cache musl-dev protobuf-dev pkgconfig openssl-dev openssl-libs-static perl make \
     clang-dev clang-static llvm-dev
 ENV LIBCLANG_PATH=/usr/lib/llvm22/lib
 ENV LIBCLANG_STATIC=1
-RUN cargo install cargo-chef --locked
 WORKDIR /src
 
-FROM chef AS planner
-COPY . .
-RUN cargo chef prepare --recipe-path recipe.json
+# Copy workspace manifests for dependency fetching
+COPY Cargo.toml Cargo.lock ./
+COPY easytier/Cargo.toml easytier/Cargo.toml
+COPY easytier-core/Cargo.toml easytier-core/Cargo.toml
+COPY easytier-proto/Cargo.toml easytier-proto/Cargo.toml
+COPY easytier-contrib/Cargo.toml easytier-contrib/Cargo.toml
+COPY easytier-web/Cargo.toml easytier-web/Cargo.toml
 
-FROM chef AS builder
-COPY --from=planner /src/recipe.json recipe.json
-RUN cargo chef cook --release --target x86_64-unknown-linux-musl \
-    --features=jemalloc -p easytier --recipe-path recipe.json
+# Create dummy src files so cargo can resolve the workspace
+RUN mkdir -p easytier/src easytier-core/src easytier-proto/src easytier-contrib/src easytier-web/src \
+    && echo "" > easytier/src/lib.rs \
+    && echo "fn main(){}" > easytier/src/main.rs \
+    && echo "" > easytier-core/src/lib.rs \
+    && echo "" > easytier-proto/src/lib.rs \
+    && echo "" > easytier-contrib/src/lib.rs \
+    && echo "" > easytier-web/src/lib.rs
+
+# Fetch and build dependencies (cached if Cargo.lock unchanged)
+RUN cargo build --release --target x86_64-unknown-linux-musl \
+    --features=jemalloc -p easytier 2>/dev/null || true
+# Remove dummy build artifacts but keep dependency artifacts
+RUN rm -rf target/x86_64-unknown-linux-musl/release/deps/easytier* \
+    target/x86_64-unknown-linux-musl/release/deps/libeasytier* \
+    target/x86_64-unknown-linux-musl/release/.fingerprint/easytier* \
+    target/x86_64-unknown-linux-musl/release/easytier*
+
+# Now copy real source and build
 COPY . .
 RUN cargo build --release --target x86_64-unknown-linux-musl \
     --features=jemalloc -p easytier \
     && strip target/x86_64-unknown-linux-musl/release/easytier-core \
               target/x86_64-unknown-linux-musl/release/easytier-cli
 
+# Runtime image
 FROM registry.sakurapuare.com/dockerhub/library/alpine:latest
 RUN apk add --no-cache tzdata tini
 WORKDIR /app
